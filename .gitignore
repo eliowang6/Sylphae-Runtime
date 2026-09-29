@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Runtime artifacts Sylphae writes into a repository it is pointed at.  Keyed on
+# the same prefix as sylphae.repo.polyglot.SYLPHAE_ARTIFACT_PREFIX, so the
+# generated index cache never shows up as source in a diff of your project.
+# ---------------------------------------------------------------------------
+.sylphae_index.json
+.sylphae*
+
+# Model weights and tokenizer vocabularies are not committed: a tokenizer is
+# 2 MB of merged vocabulary and a checkpoint is however large the model is.  Train
+# or download one and point $SYLPHAE_RUN_DIR at it.
+# See "Weights are optional" in the README.
+*.safetensors
+*.pt
+artifacts/
+tokenizer.json
+
+# Local experiment output
+runs/
+scratch/
+work/
+corpus/
+*.log

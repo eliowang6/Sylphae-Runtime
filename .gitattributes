@@ -1,0 +1,46 @@
+# Line-ending policy.
+#
+# LF everywhere, on every platform, including Windows checkouts.  Two reasons:
+#
+# 1. core.autocrlf=true is the default on Windows, which would otherwise rewrite
+#    LF to CRLF in the working tree.  Then a patch that applies cleanly in CI
+#    shows as a whole-file diff locally, and a test that asserts on line endings
+#    passes here and fails there.
+# 2. Nothing in this package is a shell script, but a contributor adding one --
+#    a dev helper, a CI entry point -- must not have to discover that a CRLF
+#    shebang breaks bash.  Forcing it globally means they cannot get it wrong.
+#
+# `text=auto` lets git detect binary content; the explicit binary entries below
+# are belt and braces for the file types this package will accumulate if people
+# start committing weights.
+
+*               text=auto eol=lf
+
+*.py            text eol=lf
+*.md            text eol=lf
+*.toml          text eol=lf
+*.ini           text eol=lf
+*.cfg           text eol=lf
+*.txt           text eol=lf
+*.json          text eol=lf
+*.jsonl         text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sh            text eol=lf
+*.bash          text eol=lf
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+
+# Never line-ending-translate these.  Model weights and tokenizer vocabularies
+# are gitignored today; if someone force-adds one, translating it corrupts it.
+*.safetensors   binary
+*.pt            binary
+*.pth           binary
+*.bin           binary
+*.npz           binary
+*.pdf           binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.zip           binary
+*.gz            binary

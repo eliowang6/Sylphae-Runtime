@@ -1,0 +1,52 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# build/ is produced by `pip install .` in-tree on some setups and is a copy of
+# sylphae/, so linting it double-counts every finding.
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+# Correctness rules only -- pycodestyle errors and pyflakes.  No import sorting
+# and no pyupgrade: this project has not adopted an autoformatter, and a rule set
+# nobody runs is worse than no rule set.  What is here is what actually holds.
+#
+# Deliberately NOT selected, and why:
+#
+#   PLC0415 (lazy import) -- ~200 occurrences, all deliberate.  A lazy import is
+#       the mechanism that keeps torch off the path of a sub-second command, and
+#       it is what makes the runtime usable with no weights installed at all.
+#       Hoisting one to module scope would reintroduce the cost this codebase
+#       measures and tests for.  Each non-obvious one is commented in place.
+#
+#   BLE001 (blind except) -- mostly wrapping subprocess timeouts, where the point
+#       is that one tool failing must not take the whole run down.  That is a
+#       per-site decision, not a global rule.
+#
+#   RUF001/002/003 (ambiguous unicode) -- this is a bilingual codebase and the
+#       CJK punctuation in the test prompts is the input under test.  "Fixing"
+#       it would corrupt the fixtures.
+#
+#   B905 / RUF005 (zip strict, unpacking instead of concat) -- style, and the
+#       call sites are clearer as written.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    "E501",   # long lines are mostly comment blocks carrying the reasoning
+    # Unused locals.  These are left in place on purpose: a binding whose value
+    # is discarded is often a *call* kept for its side effect, and ruff's
+    # autofix deletes the call along with the binding.  The ~15 remaining sites
+    # have each been read; they are harmless, and removing them is a judgement
+    # call per site rather than a mechanical one.
+    "F841",
+    "F822",   # ssd.__all__ re-exports Mamba2Block via a module __getattr__; see below
+]
+
+[tool.ruff.lint.per-file-ignores]
+# These two put an import after a sys.path.insert so the package resolves when
+# pytest is run from a checkout.  That ordering is the point of the file.
+"tests/test_ops_env_playbooks.py" = ["E402"]
+
+# `ssd.__all__` names Mamba2Block, which is not defined in this file: it is
+# re-exported through a PEP 562 module __getattr__ so that importing ssd does not
+# pull in backbone.  The re-export is deliberate and works; ruff cannot see
+# through __getattr__.
+"sylphae/model/ssd.py" = ["F822"]
