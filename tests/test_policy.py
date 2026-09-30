@@ -434,8 +434,31 @@ def test_generate_params_shape():
     model = SylphaeModel(cfg).eval()
     b = make_batch(B=3, L=8, C=2, P=6, vocab=cfg.vocab_size)
     ids = model.generate_params(b)
-    assert ids.shape == (3, 6)
+    # cfg.max_params, NOT the batch's P=6: the decode width must not be the width
+    # of the answer.  ``batch.param_ids`` is the *gold* encoding, so decoding at its
+    # width hands the model the length of the string it is being scored on --
+    # measured on iter32, the same checkpoint scored 0.7775 param_exact_match_value
+    # at the gold width while the agent's inference example (empty props) collapsed
+    # that width to 1 and returned every multi-token value as its own first token.
+    assert ids.shape == (3, cfg.max_params)
     assert ids.min() >= 0 and ids.max() < cfg.vocab_size
+
+
+def test_generate_params_width_comes_from_the_config_not_the_gold():
+    """The decode width is the model's capacity, never the gold's length.
+
+    The two numbers are different measurements: one is the product's behaviour, the
+    other is the answer's shape handed back to the model.
+    """
+    cfg = tiny_cfg()                      # max_params=8
+    torch.manual_seed(0)
+    model = SylphaeModel(cfg).eval()
+    narrow = make_batch(B=2, L=12, C=2, P=1, vocab=cfg.vocab_size)
+    wide = make_batch(B=2, L=12, C=2, P=6, vocab=cfg.vocab_size)
+    assert model.generate_params(narrow).shape == (2, cfg.max_params)
+    assert model.generate_params(wide).shape == (2, cfg.max_params)
+    # an explicit width still wins, for a caller that bounds the decode
+    assert model.generate_params(wide, max_len=3).shape == (2, 3)
 
 
 def test_generate_params_stops_changing_on_repeat():

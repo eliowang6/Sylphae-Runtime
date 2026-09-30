@@ -286,7 +286,7 @@ class ReflexAgent:
             idx = None
             if cache_file.exists():
                 try:
-                    idx = RepoIndex.load(cache_file)
+                    idx = RepoIndex.load(cache_file, expect_root=self.root)
                 except Exception:
                     idx = None
             if idx is None:
@@ -672,14 +672,25 @@ class ReflexAgent:
                 op_id = int(out.op_logits[0].argmax(dim=-1).item())
                 op_kind = OP_KINDS[op_id] if 0 <= op_id < len(OP_KINDS) else "replace_literal"
 
-                # Generate parameter (clean byte decode up to eos)
-                param_ids = out.param_logits[0].argmax(dim=-1).tolist()
+                # Generate parameter.  This must be *autoregressive*: the previous
+                # code read the teacher-forced ``out.param_logits`` argmax, whose step
+                # >= 1 is conditioned on ``<pad>`` (there is no gold prefix at
+                # inference), so a multi-token value was emitted from a prefix of pads.
+                # That is a decode-path defect independent of the decoder's
+                # architecture -- see ROADMAP 12.15.
+                gen = getattr(self.model, "generate_params", None)
+                param_ids = (
+                    gen(batch)[0].tolist()
+                    if gen is not None
+                    else out.param_logits[0].argmax(dim=-1).tolist()
+                )
                 clean_ids = []
                 for t in param_ids:
-                    if int(t) == self.tokenizer.eos_id:
+                    ti = int(t)
+                    if ti in (self.tokenizer.eos_id, self.tokenizer.pad_id):
                         break
-                    if int(t) >= 7:
-                        clean_ids.append(int(t))
+                    if ti >= 7:
+                        clean_ids.append(ti)
                 param_val = self.tokenizer.decode(clean_ids).strip()
                 conf = float(out.confidence[0].item())
 

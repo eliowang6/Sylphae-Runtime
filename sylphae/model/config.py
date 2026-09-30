@@ -12,10 +12,30 @@ from dataclasses import dataclass, fields, asdict
 
 from .ssd import SSDCfg
 
-__all__ = ["ModelConfig", "SSD_FIELD_NAMES", "REFERENCE_CONFIG"]
+__all__ = [
+    "ModelConfig",
+    "SSD_FIELD_NAMES",
+    "REFERENCE_CONFIG",
+    "PARAM_DEC_LAYERS",
+    "PARAM_DEC_HEADS",
+    "PARAM_DEC_MAX_POS",
+]
 
 
 SSD_FIELD_NAMES = tuple(f.name for f in fields(SSDCfg))
+
+#: Parameter-decoder geometry.  Structural, not config: the decoder it replaced
+#: (a ``GRUCell`` over ``pooled``) had a fixed depth too, and the parameter count
+#: in :meth:`ModelConfig.n_params_estimate` is asserted against
+#: ``SylphaeModel.num_parameters()`` in the suite, so a geometry that is not
+#: reflected here fails loudly rather than shipping a wrong config.
+#:
+#: ``PARAM_DEC_MAX_POS`` bounds the learned positional table.  It matches
+#: ``ModelConfig.max_params``'s own documented ceiling (256), so every admissible
+#: ``P`` has a position.
+PARAM_DEC_LAYERS = 2
+PARAM_DEC_HEADS = 4
+PARAM_DEC_MAX_POS = 256
 
 
 @dataclass
@@ -76,8 +96,9 @@ class ModelConfig:
         if self.max_params > 256:
             raise ValueError(
                 f"ModelConfig.max_params must be <= 256, got {self.max_params}. The field is "
-                "bounded (it widens the GRU decode steps and the param logits tensor), not "
-                "left unbounded; 32 remains the default every prior run trained at."
+                "bounded (it widens the decoder's positional table and the param logits "
+                "tensor), not left unbounded; 32 remains the default every prior run "
+                "trained at."
             )
         if not (0.0 <= self.dropout < 1.0):
             raise ValueError(f"ModelConfig.dropout must be in [0, 1), got {self.dropout}")
@@ -141,10 +162,16 @@ class ModelConfig:
             + d * self.n_ops + self.n_ops                 # op head
             + (d + 1)                                      # confidence
             + (d + 1)                                      # memory-write gate
-            + d * ph + ph                                 # decoder context
-            + V * pe                                      # decoder input embedding
-            + 3 * (pe + ph) * ph + 3 * ph * ph + 6 * ph  # GRUCell: ih, hh, 2 biases
-            + ph * V + V                                  # decoder output
+            + d * ph + ph                                  # decoder ctx projection (pooled -> hidden)
+            + d * ph + ph                                  # decoder request-key projection
+            + V * pe                                       # decoder token embedding
+            + pe * ph + ph                                 # decoder token input projection
+            + PARAM_DEC_MAX_POS * ph                       # decoder positional table
+            # decoder layers: 2 x MultiheadAttention (4 h^2 + 4 h each) + FFN
+            # (4 h^2 + 3 h) + 3 LayerNorms (2 h each)
+            + PARAM_DEC_LAYERS * (12 * ph * ph + 17 * ph)
+            + 2 * ph                                       # decoder final LayerNorm
+            + ph * V + V                                   # decoder output projection
         )
 
         return backbone + heads

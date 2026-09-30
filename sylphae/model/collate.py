@@ -560,6 +560,18 @@ def collate(
             if param_strs[b] and not param_answerable(ex):
                 param_strs[b] = ""
     encoded = tok.encode_batch(param_strs, p_max)
+    #: Every non-empty target is terminated with ``<eos>``, and the terminator is
+    #: supervised (it sits inside ``param_mask``).  Without it "when to stop" has
+    #: no gradient at all: ``encode_batch`` adds no specials, so a gold value of
+    #: ``9000`` trained as ``['9','000']`` and the decoder emitted
+    #: ``['9','000','0','9','000',...]`` forever at any width above 2 (MEASURED,
+    #: ``scratch/probe_p1_truncation.py``: iter32 reproduces the value's first two
+    #: tokens and then never stops).  One slot is reserved for the terminator so
+    #: widening ``max_params`` cannot silently evict it.
+    encoded = [
+        (ids[: max(0, p_max - 1)] + [tok.eos_id]) if ids else []
+        for ids in encoded
+    ]
     P = max(1, max((len(e) for e in encoded), default=0))
     param_ids = torch.full((B, P), tok.pad_id, dtype=torch.long)
     param_mask = torch.zeros((B, P), dtype=torch.bool)

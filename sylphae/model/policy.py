@@ -6,8 +6,8 @@ Heads (DESIGN.md section 3, INTERFACES.md section 4):
 target head      scalar score per candidate, read from the hidden state at
                  each candidate's ``<cand>`` token
 op head          softmax over the 16-op vocabulary
-param head       autoregressive GRU decoder over the pooled representation,
-                 ``P <= 32`` tokens
+param head       autoregressive decoder that cross-attends the request token
+                 grid, ``P <= 32`` tokens
 confidence head  sigmoid scalar -- the escalation trigger, not decoration
 memory head      sigmoid scalar -- how much of this request's state persists
 ===============  ==========================================================
@@ -32,9 +32,14 @@ import torch.nn.functional as F
 
 from .backbone import Mamba2Backbone
 from .collate import Batch
-from .config import ModelConfig
+from .config import (
+    PARAM_DEC_HEADS,
+    PARAM_DEC_LAYERS,
+    PARAM_DEC_MAX_POS,
+    ModelConfig,
+)
 from .ssd import SSDCfg
-from .tokenizer import CAND_ID, SEP_ID
+from .tokenizer import BOS_ID, CAND_ID, EOS_ID, PAD_ID, SEP_ID
 
 __all__ = ["PolicyOutput", "MemState", "ParamDecoder", "SylphaeModel"]
 
@@ -108,12 +113,66 @@ class MemState:
 # --------------------------------------------------------------------------
 
 
-class ParamDecoder(nn.Module):
-    """Cheap autoregressive decoder: ``P`` GRU steps over the pooled vector.
+class _ParamDecoderLayer(nn.Module):
+    """One pre-norm decoder layer: causal self-attention, request cross-attention,
+    then a feed-forward block.  ``req_mask`` is a *keep* mask; it is inverted to
+    the ``key_padding_mask`` ``MultiheadAttention`` expects inside ``forward``."""
 
-    Deliberately not a transformer.  ``P <= 32``, so the cost is a few hundred
-    microseconds of launch-bound work, and the head only has to emit a literal,
-    a name or a short argument string.
+    def __init__(self, hidden: int, n_heads: int):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden, 2 * hidden), nn.GELU(), nn.Linear(2 * hidden, hidden),
+        )
+        self.ln1 = nn.LayerNorm(hidden)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.ln3 = nn.LayerNorm(hidden)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        req: torch.Tensor,
+        req_mask: torch.Tensor,
+        causal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        n = self.ln1(x)
+        h, _ = self.self_attn(n, n, n, attn_mask=causal_mask, need_weights=False)
+        x = x + h
+        h, _ = self.cross_attn(
+            self.ln2(x), req, req,
+            key_padding_mask=~req_mask,
+            need_weights=False,
+        )
+        x = x + h
+        return x + self.ff(self.ln3(x))
+
+
+class ParamDecoder(nn.Module):
+    """Autoregressive parameter decoder over the **request** token states.
+
+    Why it is not a GRU over ``pooled`` (this class used to be one)
+    ---------------------------------------------------------------
+    Until this version the decoder was a ``GRUCell`` whose only conditioning was
+    ``pooled``: one 384-d vector, the hidden state at the last non-pad position,
+    i.e. *after* the request, the source window and every candidate.  A
+    frozen-backbone probe measured what that costs (ROADMAP 12.15, iter30):
+
+    * the gold value's first digit decodes linearly from ``pooled`` at **0.400**
+      on held-out rows (chance 0.10), and a 256-unit MLP does **not** beat it
+      (**0.375**; train 1.000) -- what is there is memorisation, not signal;
+    * at the value's own request-token position the same probe reads **0.665**;
+    * a linear per-position scorer finds the gold span at **top-1 0.722**;
+    * on the rows it trained on, the GRU emitted the exact value **0/24**.
+
+    The information is in the request and the decoder was architected not to read
+    it.  This decoder cross-attends the request token grid instead, so the copy
+    source is reachable by construction.  The output contract is unchanged --
+    ``(B, P, vocab_size)`` -- so no ``Batch`` field, loss, or decode site moved.
+
+    ``req_tokens``/``req_mask`` are the token grid ``_token_grids`` already builds
+    for the target head.  They are optional so the streaming path (which never
+    decodes parameters) can pass ``None`` and get a pooled-only decode.
     """
 
     def __init__(
@@ -124,48 +183,123 @@ class ParamDecoder(nn.Module):
         vocab_size: int,
         bos_id: int,
         pad_id: int,
+        eos_id: int,
     ):
         super().__init__()
         self.hidden = hidden
         self.bos_id = bos_id
         self.pad_id = pad_id
+        self.eos_id = eos_id
         self.ctx_proj = nn.Linear(d_model, hidden)
+        self.req_proj = nn.Linear(d_model, hidden)
         self.emb = nn.Embedding(vocab_size, emb_dim)
-        self.cell = nn.GRUCell(emb_dim + hidden, hidden)
+        self.inp = nn.Linear(emb_dim, hidden)
+        self.pos = nn.Embedding(PARAM_DEC_MAX_POS, hidden)
+        self.layers = nn.ModuleList(
+            [_ParamDecoderLayer(hidden, PARAM_DEC_HEADS) for _ in range(PARAM_DEC_LAYERS)]
+        )
+        self.norm = nn.LayerNorm(hidden)
         self.out = nn.Linear(hidden, vocab_size)
 
     def _initial(self, pooled: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.ctx_proj(pooled))
 
-    def forward(self, pooled: torch.Tensor, param_ids: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _causal_mask(P: int, device, dtype) -> torch.Tensor:
+        m = torch.full((P, P), float("-inf"), device=device, dtype=dtype)
+        return torch.triu(m, diagonal=1)
+
+    def _run(
+        self,
+        pooled: torch.Tensor,
+        prev: torch.Tensor,
+        req_tokens: torch.Tensor | None,
+        req_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        B, P = prev.shape
+        if P > PARAM_DEC_MAX_POS:
+            raise ValueError(
+                f"ParamDecoder: {P} positions exceeds the positional table "
+                f"({PARAM_DEC_MAX_POS}); lower max_params or raise PARAM_DEC_MAX_POS."
+            )
+        ar = torch.arange(P, device=prev.device)
+        x = self.inp(self.emb(prev)) + self.pos(ar).unsqueeze(0)
+        x = x + self._initial(pooled).unsqueeze(1)
+
+        if req_tokens is not None and req_tokens.shape[1] > 0:
+            req = self.req_proj(req_tokens)
+            keep = (
+                torch.ones(req.shape[:2], dtype=torch.bool, device=req.device)
+                if req_mask is None
+                else req_mask.to(torch.bool)
+            )
+            # An all-masked row makes the cross-attention softmax undefined.  Point
+            # it at slot 0 -- a real token for every row that has a request, a zero
+            # vector for the streaming/rng case -- so the row is neutral, not NaN.
+            empty = ~keep.any(dim=1)
+            if bool(empty.any()):
+                keep = keep.clone()
+                keep[empty, 0] = True
+        else:
+            req = pooled.new_zeros(B, 1, self.hidden)
+            keep = torch.ones(B, 1, dtype=torch.bool, device=pooled.device)
+
+        causal = self._causal_mask(P, x.device, x.dtype)
+        for layer in self.layers:
+            x = layer(x, req, keep, causal)
+        return self.out(self.norm(x))
+
+    def forward(
+        self,
+        pooled: torch.Tensor,
+        param_ids: torch.Tensor,
+        req_tokens: torch.Tensor | None = None,
+        req_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Teacher-forced logits, shape (B, P, vocab_size).
 
         Step 0 is fed ``<bos>``; step ``t`` is fed ``param_ids[:, t-1]``.
         """
         B, P = param_ids.shape
-        ctx = self._initial(pooled)
-        h = ctx
         prev = torch.cat(
             [param_ids.new_full((B, 1), self.bos_id), param_ids[:, :-1]], dim=1
         )
-        logits = []
-        for t in range(P):
-            h = self.cell(torch.cat([self.emb(prev[:, t]), ctx], dim=-1), h)
-            logits.append(self.out(h))
-        return torch.stack(logits, dim=1)
+        return self._run(pooled, prev, req_tokens, req_mask)
 
     @torch.no_grad()
-    def generate(self, pooled: torch.Tensor, max_len: int) -> torch.Tensor:
-        """Greedy decode, shape (B, max_len).  Stops early on ``<eos>``/``<pad>``."""
+    def generate(
+        self,
+        pooled: torch.Tensor,
+        max_len: int,
+        req_tokens: torch.Tensor | None = None,
+        req_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Greedy decode, shape (B, max_len).
+
+        Each step re-runs the full prefix through the (causal) self-attention, so
+        the emission is conditioned on the model's *own* previous tokens.  The
+        GRU this replaced carried that recurrence in its hidden state; a
+        transformer has to see the prefix to reproduce it.
+
+        A row that has emitted its terminator is frozen on ``<pad>`` and the loop
+        exits once every row has.  Two reasons, not one: the decode is *over* for
+        that row, so continuing would append junk after the value, and ``max_len``
+        is ``cfg.max_params`` (64) rather than the gold width, so an unconditional
+        loop would pay 64 decoder passes to emit a two-token value.
+        """
         B = pooled.shape[0]
-        ctx = self._initial(pooled)
-        h = ctx
-        tok = torch.full((B,), self.bos_id, dtype=torch.long, device=pooled.device)
+        bos = pooled.new_full((B, 1), self.bos_id, dtype=torch.long)
         out = torch.full((B, max_len), self.pad_id, dtype=torch.long, device=pooled.device)
+        done = torch.zeros(B, dtype=torch.bool, device=pooled.device)
         for t in range(max_len):
-            h = self.cell(torch.cat([self.emb(tok), ctx], dim=-1), h)
-            tok = self.out(h).argmax(dim=-1)
-            out[:, t] = tok
+            if bool(done.all()):
+                break
+            prefix = torch.cat([bos, out[:, :t]], dim=1)
+            logits = self._run(pooled, prefix, req_tokens, req_mask)
+            nxt = logits[:, -1].argmax(dim=-1)
+            nxt = torch.where(done, torch.full_like(nxt, self.pad_id), nxt)
+            out[:, t] = nxt
+            done = done | (nxt == self.eos_id) | (nxt == self.pad_id)
         return out
 
 
@@ -331,8 +465,9 @@ class SylphaeModel(nn.Module):
             hidden=cfg.param_dec_hidden,
             emb_dim=cfg.param_emb_dim,
             vocab_size=cfg.vocab_size,
-            bos_id=1,   # INTERFACES.md: <bos> is id 1
-            pad_id=0,   # <pad> is id 0
+            bos_id=BOS_ID,   # INTERFACES.md section 4: the frozen special-token order
+            pad_id=PAD_ID,
+            eos_id=EOS_ID,
         )
 
     # -- forward -----------------------------------------------------------
@@ -558,7 +693,7 @@ class SylphaeModel(nn.Module):
         return PolicyOutput(
             target_logits=target_logits,
             op_logits=self.op_head(pooled),
-            param_logits=self.param_decoder(pooled, batch.param_ids),
+            param_logits=self.param_decoder(pooled, batch.param_ids, req_tokens, req_mask),
             confidence=torch.sigmoid(self.conf_head(pooled).squeeze(-1)),
             mem_write=torch.sigmoid(self.mem_head(pooled).squeeze(-1)),
         )
@@ -570,8 +705,26 @@ class SylphaeModel(nn.Module):
 
     @torch.no_grad()
     def generate_params(self, batch: Batch, max_len: int | None = None) -> torch.Tensor:
-        """Greedy parameter tokens, shape (B, P).  Used by the eval harness."""
+        """Greedy parameter tokens, shape (B, P).  Used by the eval harness.
+
+        ``P`` defaults to ``cfg.max_params`` -- the model's declared capacity --
+        and **not** to ``batch.param_ids``' width.  The width of the gold encoding
+        is a property of the answer, so decoding at that width hands the model the
+        length of the string it is being scored on: measured on iter32, the same
+        checkpoint emits the value's first token and stops at the inference width
+        the agent actually uses (``op.props`` is empty there, so ``P`` collapses to
+        1) while scoring 0.78 ``param_exact_match_value`` at the gold width.  One
+        number was a measurement and the other was the answer's shape.
+
+        The request token grid is rebuilt here so the emission is conditioned on
+        the same tokens the teacher-forced path sees -- a decoder that reads the
+        request must read it at decode time too, or train and inference disagree
+        (which is exactly the class of defect this decoder replaced).
+        """
         hidden = self.backbone(batch.input_ids)
         pooled = self._pool(hidden, batch.attention_mask)
-        P = int(batch.param_ids.shape[1]) if max_len is None else int(max_len)
-        return self.param_decoder.generate(pooled, P)
+        req_tokens = req_mask = None
+        if hidden.shape[1] > 1:
+            req_tokens, req_mask, _cand_tokens, _cand_mask = self._token_grids(batch, hidden)
+        P = int(self.cfg.max_params) if max_len is None else int(max_len)
+        return self.param_decoder.generate(pooled, P, req_tokens, req_mask)

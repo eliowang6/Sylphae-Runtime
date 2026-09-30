@@ -20,7 +20,7 @@ from sylphae.model.collate import (
     param_target_string,
 )
 from sylphae.model.config import ModelConfig
-from sylphae.model.tokenizer import CAND_ID, ENDCAND_ID
+from sylphae.model.tokenizer import CAND_ID, ENDCAND_ID, EOS_ID
 
 
 def make_example(i=0, kind="replace_literal", repo="a/b", request="set timeout to 60",
@@ -234,6 +234,57 @@ def test_param_ids_truncated_at_max_params(tiny_tokenizer):
     b = collate([ex], tiny_tokenizer, None, cfg)
     assert b.param_ids.shape[1] <= 8
     assert b.param_mask[0].all(), "a truncated param must still fill every slot"
+
+
+def test_param_target_is_terminated_and_the_terminator_is_supervised(tiny_tokenizer):
+    """The gold target ends with ``<eos>`` and the mask covers that position.
+
+    ``encode_batch`` adds no specials, so a target of ``9000`` trained as
+    ``['9','000']`` and "when to stop" had no gradient anywhere: at any decode
+    width above 2 the head emitted the value's own tokens and then kept going
+    (MEASURED on iter32, ``[31, 12444, 22, 31, 12444, 12444, ...]`` ->
+    ``"9000090000000..."``).  Supervising the terminator is what makes a width
+    above the gold's length decodable at all.
+    """
+    cfg = tiny_cfg()
+    ex = make_example(0, request="set timeout to 5", props={"old": "1", "new": "5"})
+    assert param_answerable(ex)
+    b = collate([ex], tiny_tokenizer, None, cfg)
+    n = int(b.param_mask[0].sum())
+    ids = b.param_ids[0, :n].tolist()
+    assert ids[-1] == EOS_ID, "the last supervised position must be the terminator"
+    assert EOS_ID not in ids[:-1]
+    # decode drops specials, so the string the eval compares is still the value
+    assert tiny_tokenizer.decode(ids) == param_target_string(ex)
+
+
+def test_param_terminator_survives_truncation_at_max_params(tiny_tokenizer):
+    """A value longer than ``max_params`` must not evict its own terminator."""
+    cfg = tiny_cfg(max_params=8)
+    value = "z" * 400
+    ex = make_example(0, request=f"set the marker to {value}",
+                      props={"old": "a", "new": value})
+    b = collate([ex], tiny_tokenizer, None, cfg)
+    assert b.param_ids.shape[1] == 8
+    assert b.param_mask[0].all()
+    assert int(b.param_ids[0, -1]) == EOS_ID
+
+
+def test_inference_shaped_example_collapses_to_one_param_slot(tiny_tokenizer):
+    """The agent's inference example has empty props, so the gold width is 1.
+
+    ``reflex.py`` builds its example with ``op.props = {}`` -- there is no answer
+    at inference, so ``param_target_string`` is ``""`` and ``P`` collapses to 1.
+    Recorded because decoding at *this* width is what truncated every multi-token
+    value (``9000 -> 9``, ``410 -> 4``, ``120 -> 1``) while every single-token
+    value (``60``, ``16``, ``5``) passed.  ``generate_params`` must not read this
+    width; see test_policy.py.
+    """
+    cfg = tiny_cfg()
+    ex = make_example(0, request="把服务端口修改为9000", props={})
+    b = collate([ex], tiny_tokenizer, None, cfg)
+    assert b.param_ids.shape[1] == 1
+    assert int(b.param_mask[0].sum()) == 0
 
 
 def test_conf_labels_structured_vs_freeform(tiny_tokenizer):

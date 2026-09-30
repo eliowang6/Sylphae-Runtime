@@ -828,16 +828,44 @@ class RepoIndex:
         Path(path).write_text(json.dumps(self.to_dict()), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: Path) -> "RepoIndex":
+    def load(cls, path: Path, expect_root: Path | None = None) -> "RepoIndex":
+        """Read a cache.  ``expect_root`` refuses a cache built for another directory.
+
+        A cache is keyed only by filename, and the filename is the same in every
+        checkout, so a directory that was copied, moved, or cloned from a template
+        arrives carrying a cache describing a *different* repository -- whose file
+        list names paths that do not exist here.  ``root`` is recorded in the payload
+        precisely so this is checkable, and nothing checked it.
+
+        MEASURED: ``work/real_projects/nextjs_dashboard/.sylphae_index.json`` was
+        written before the ``ecra`` -> ``sylphae`` rename and still listed
+        ``.ecra_index.json`` as a 1-line file whose symbol table was the whole repo's.
+        Two of the fourteen real-world scenarios then "located" that nonexistent file
+        and escalated with *"No patch could be constructed ... on
+        '.ecra_index.json'"* -- the agent editing its own cache.  Schema version 3
+        matched, so the only available check is the one the payload was already
+        carrying.
+        """
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         version = payload.get("version")
         if version != SCHEMA_VERSION:
             raise ValueError(
                 f"RepoIndex schema version {version!r} != {SCHEMA_VERSION}; rebuild the index"
             )
+        root = Path(payload["root"])
+        if expect_root is not None:
+            try:
+                same = root.resolve() == Path(expect_root).resolve()
+            except OSError:  # pragma: no cover - unresolvable path
+                same = False
+            if not same:
+                raise ValueError(
+                    f"RepoIndex cache at {path} was built for {str(root)!r}, not "
+                    f"{str(expect_root)!r}; rebuild the index"
+                )
         records = [FileRecord.from_dict(d) for d in payload.get("files", [])]
         edges = [(int(a), int(b)) for a, b in payload.get("edges", [])]
-        return cls(Path(payload["root"]), records, edges)
+        return cls(root, records, edges)
 
     # -- introspection -----------------------------------------------------------------
 
