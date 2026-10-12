@@ -85,7 +85,8 @@ If you do train one, the runtime uses it. See
 $ pip install sylphae-runtime
 ```
 
-Python 3.11+. For source:
+Python 3.11+. This installs only the standard library and adds a `sylphae`
+command. For source:
 
 ```console
 $ git clone https://github.com/eliowang6/Sylphae-Runtime
@@ -94,10 +95,16 @@ $ cd Sylphae-Runtime && pip install -e ".[dev]"
 
 ### Optional extras
 
+The base install is deliberately empty: the zero-weight path is pure stdlib, and
+`torch` is imported lazily (PEP 562) only when a checkpoint is pointed at — so a
+sub-second command does not pull a gigabyte.
+
 | Extra | Why |
 |---|---|
-| `trash` | `send2trash`. Without it, a "delete" is **refused** rather than falling back to `unlink` — see [§Safety](#safety). |
-| `dev` | pytest, pytest-asyncio, ruff. |
+| `weights` | `torch`, `safetensors`, `tokenizers`. Needed to run the trained reflex at all; without it the model path reports itself unavailable. |
+| `vision` | `pillow`, for the playbooks that read a screenshot. |
+| `trash` | `send2trash` (POSIX only — on Windows the recycle bin is used directly via shell32). Without it, a "delete" is **refused** rather than falling back to `unlink` — see [§Safety](#safety). |
+| `dev` | everything above, plus pytest, pytest-asyncio and ruff, so a checkout can be tested as shipped. |
 
 ### External tools
 
@@ -224,7 +231,10 @@ if spec is not None and spec.kind != "freeform_patch":
     assert apply_op(old_source, spec) == new_source   # guaranteed
 ```
 
-26 kinds: `replace_literal`, `rename_symbol`, `change_condition`,
+26 kinds total: `no_op` (id 0, `NEVER_DETECTED` — a diff that is genuinely nothing, emitted
+only by the id-0 branch) and 25 structured, detectable ones:
+
+`replace_literal`, `rename_symbol`, `change_condition`,
 `modify_call_args`, `change_default`, `add_import`, `remove_import`,
 `add_guard`, `insert_statement`, `delete_statement`, `add_decorator`,
 `change_return`, `modify_string`, `wrap_try_except`, `freeform_patch`,
@@ -413,12 +423,16 @@ parent project's `DESIGN.md` and `ROADMAP.md`.
 
 ```console
 $ pip install -e ".[dev]"
-$ pytest                      # 962 passed, 8 skipped
+$ pytest                      # 1000 passed, 8 skipped
 $ ruff check .
 ```
 
 The 8 skips are the tests that need a trained tokenizer artifact, which is not
 committed. They are the only tests that require weights to run at all.
+
+Two content-search tests need `rg` on `PATH`. Without it they fail in the
+in-process fallback — that is an environment gap on this checkout, not a defect
+in the fallback itself, and installing `ripgrep` turns them green.
 
 Tests are invariants, not coverage. Every module is expected to ship at least one
 negative case — a test that only ever prints PASS is worthless, and the ones here
