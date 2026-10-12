@@ -1539,10 +1539,50 @@ class ReflexAgent:
 
             _LITERAL_RE = r"(=\s*|:\s*|\bvalue\s*=\s*)([0-9]+(?:\.[0-9]+)?|\"[^\"]*\"|'[^']*')"
 
+            #: ``_LITERAL_RE`` captures a bare number; a request that quotes a CSS
+            #: value names its unit too -- ``from 200px to 300px``.  The unit sits in
+            #: the line just past the match, so the captured ``200`` and the requested
+            #: ``200px`` are the same edit site, and comparing the two raw declined a
+            #: request the reflex had already located correctly.
+            _VALUE_UNIT_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z%]*)$")
+
+            def _split_value_unit(text: str) -> tuple[str, str] | None:
+                m = _VALUE_UNIT_RE.match(text.strip().strip("\"'"))
+                return (m.group(1), m.group(2)) if m else None
+
+            def _value_is_old(cur_val: str, line: str, m: "re.Match[str]") -> bool:
+                if cur_val.lower() == old_val_literal.lower():
+                    return True
+                cur_split = _split_value_unit(cur_val)
+                old_split = _split_value_unit(old_val_literal)
+                if cur_split is None or old_split is None:
+                    return False
+                #: Same number, and the request named a unit the capture lacks.  The
+                #: unit must be sitting right behind the match, or this is a different
+                #: literal -- ``200rem`` is not the ``200px`` the request quoted.
+                if cur_split[0] != old_split[0] or not old_split[1] or cur_split[1] != "":
+                    return False
+                tail = line[m.end(2):m.end(2) + len(old_split[1])]
+                return tail.lower() == old_split[1].lower()
+
             def _emit_literal(i: int, line: str, m: "re.Match[str]") -> tuple[OpSpec, str] | None:
                 cur_val = m.group(2).strip("\"'")
                 new_literal = param_val if (param_val.startswith('"') or param_val.replace('.', '', 1).isdigit()) else f'"{param_val}"' if ('"' in m.group(2) or "'" in m.group(2)) else param_val
-                new_line = line[:m.start(2)] + new_literal + line[m.end(2):]
+                #: Consume the uncaptured unit only when the replacement carries
+                #: its own: ``200px`` -> ``300px`` would otherwise emit ``300pxpx``.
+                #: A bare ``300`` leaves the line's ``px`` standing, which is what
+                #: ``从 200px 改为 300`` asks for.
+                end = m.end(2)
+                cur_split = _split_value_unit(cur_val)
+                old_split = _split_value_unit(old_val_literal or "")
+                new_split = _split_value_unit(new_literal)
+                if (
+                    old_split is not None and old_split[1] != ""
+                    and cur_split is not None and cur_split[1] == ""
+                    and new_split is not None and new_split[1] != ""
+                ):
+                    end += len(old_split[1])
+                new_line = line[:m.start(2)] + new_literal + line[end:]
                 raw_line = lines_raw[i - 1]
                 ending = "\r\n" if raw_line.endswith("\r\n") else ("\n" if raw_line.endswith("\n") else "")
                 spec = OpSpec(
@@ -1564,7 +1604,7 @@ class ReflexAgent:
                 value_hits: list[tuple[int, str, "re.Match[str]"]] = []
                 for i, line in check_lines:
                     m = re.search(_LITERAL_RE, line)
-                    if m and m.group(2).strip("\"'").lower() == old_val_literal.lower():
+                    if m and _value_is_old(m.group(2).strip("\"'"), line, m):
                         value_hits.append((i, line, m))
                 if value_hits:
                     preferred = [
@@ -1584,7 +1624,7 @@ class ReflexAgent:
                     m = re.search(_LITERAL_RE, line)
                     if m:
                         cur_val = m.group(2).strip("\"'")
-                        if old_val_literal is not None and cur_val.lower() != old_val_literal.lower():
+                        if old_val_literal is not None and not _value_is_old(cur_val, line, m):
                             continue
                         result = _emit_literal(i, line, m)
                         if result is not None:
