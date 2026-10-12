@@ -142,7 +142,7 @@ class MultiFileRenameResult:
                 f"place(s) ({shown}"
                 + (f" (+{len(self.doc_leftovers) - 3} more)"
                    if len(self.doc_leftovers) > 3 else "") + "); not rewritten because a "
-                f"docstring is prose, not a reference")
+                "docstring is prose, not a reference")
         return "; ".join(parts)
 
 

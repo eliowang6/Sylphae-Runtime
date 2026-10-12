@@ -1100,9 +1100,11 @@ class ReflexAgent:
                 # fire on the benchmark's Chinese request until this round, so the producer and the
                 # executor had never been asked to agree. Both names are kept -- ``insert_before`` is
                 # what the plan says it is, and dropping it would make the spec unreadable next to
-                # the plan it came from.
+                # the plan it came from. Both are ``str(n)`` because every prop crosses the JSON
+                # boundary and ``OpSpec`` rejects a non-str; the plan's bare ``int`` cannot go in
+                # as-is.
                 "line": str(n),
-                "insert_before": n,
+                "insert_before": str(n),
                 # ``_apply_insert`` also reads ``text``. Fixed one field at a time by watching the
                 # error move: after ``line`` the next complaint was ``requires props['text']``.
                 # ``new_text`` is the guard body the plan produced, which is the same quantity, so
@@ -1110,7 +1112,6 @@ class ReflexAgent:
                 "text": plan.text,
                 "parameter": plan.parameter,
                 "return_source": plan.return_source,
-                "insert_before": str(n),
             },
         )
         return spec, new_src

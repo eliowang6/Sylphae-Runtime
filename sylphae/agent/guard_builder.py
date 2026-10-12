@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 __all__ = [
     "GuardPlan",

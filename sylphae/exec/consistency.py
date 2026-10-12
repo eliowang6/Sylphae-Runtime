@@ -257,8 +257,6 @@ def find_references(
     # ripgrep when it is available, because the cost of this stage is I/O over the whole
     # tree and that is the one thing a Python loop is bad at. The Python fallback is the
     # same predicate, and `None` from the helper means "could not ask", not "no hits".
-    from sylphae.repo.index import iter_python_files
-
     hits = _files_containing(root, symbol)
     if hits is None:
         hits = [

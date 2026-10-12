@@ -46,7 +46,6 @@ the failure mode 12.35 documented for ``clean`` reading only ``syntax_valid``.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any
 

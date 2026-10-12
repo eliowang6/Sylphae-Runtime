@@ -52,7 +52,6 @@ and a runner that reports that as 0/0 is indistinguishable from a project with n
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
