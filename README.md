@@ -423,12 +423,14 @@ parent project's `DESIGN.md` and `ROADMAP.md`.
 
 ```console
 $ pip install -e ".[dev]"
-$ pytest                      # 1000 passed, 8 skipped
+$ pytest                      # 1014 passed, 17 skipped
 $ ruff check .
 ```
 
-The 8 skips are the tests that need a trained tokenizer artifact, which is not
-committed. They are the only tests that require weights to run at all.
+The 17 skips are the tests that need a trained tokenizer artifact, which is not
+committed, plus the guard-builder tests that need the fixture repos under
+`work/repos/`, which the runtime does not ship. They are the only tests that
+require weights or corpus fixtures to run at all.
 
 Two content-search tests need `rg` on `PATH`. Without it they fail in the
 in-process fallback — that is an environment gap on this checkout, not a defect
