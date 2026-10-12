@@ -1,3 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sylphae-runtime"
+version = "0.1.0"
+description = "A local, millisecond-latency reflex layer for code edits."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Not yet chosen" }
+# Everything the zero-weight path needs is the standard library.  torch is
+# imported lazily (PEP 562) only when a checkpoint is pointed at, so listing it
+# here would make a sub-second command install a gigabyte.  It is in the
+# `weights` extra instead, and the runtime reports itself unavailable without it.
+dependencies = []
+
+[project.optional-dependencies]
+weights = [
+    "torch>=2.0",
+    "safetensors",
+    "tokenizers",
+]
+vision = [
+    "pillow",
+]
+trash = [
+    # send2trash is POSIX-only here: on Windows the recycle bin is used directly
+    # via shell32, so this extra is a no-op there.  Without it a delete is
+    # refused rather than falling back to unlink.  See README "Safety".
+    "send2trash; sys_platform != 'win32'",
+]
+# The test suite is part of the contract here, and 7 test files import torch at
+# module scope (plus one that needs PIL), so a checkout-and-test has to pull the
+# model stack.  The 8 documented skips are the tokenizer artifact, which is not
+# committed -- see README "Development".
+dev = [
+    "sylphae-runtime[weights,vision]",
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[project.scripts]
+sylphae = "sylphae.agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sylphae*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
