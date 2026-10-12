@@ -546,19 +546,65 @@ def collate(
     )
 
     param_strs = [param_target_string(ex) for ex in examples]
-    #: Rows whose value is not in the request cannot be learned from the request
-    #: (see :func:`param_answerable`).  Masking them out of ``L_param`` is what
-    #: stops the parameter head being supervised on the unanswerable rows that
-    #: previously taught it the old-source prior (12.11/12.12) -- on the current
-    #: corpus that is 13,888 of 15,382 parameterised rows (90.3%).  The row is still
-    #: fully supervised for the other heads -- the target, op, conf and mem labels
-    #: are all sound -- only the parameter emission is declared unlearnable.
-    #: ``False`` restores the old behaviour for an ablation.
+    # ROUND 115. Silence has to be supervised, or the head can never learn it.
+    #
+    # MEASURED (13.47). Target-type mix per training tier:
+    #
+    #     tier         rows  no-target  answ-value  masked   no-target share
+    #     tierA       31634      18960         356    12318   59.9%   <- real commits
+    #     tierB        1700       1057           0      643   62.2%
+    #     tierR        2614          0        2024      590    0.0%
+    #     tierV        5351          0        4027     1324    0.0%   <- synthetic
+    #     tierV2       1500          0        1500        0    0.0%   <- synthetic
+    #     tierVtext    5351          0        5351        0    0.0%   <- synthetic
+    #
+    # **All three synthetic tiers are exactly 0.0% no-target**, while real commits are ~60% no-target. And every
+    # no-target row used to encode to ``[]``, leaving ``param_mask`` all-False, i.e. **zero gradient**. So the
+    # parameter head's entire supervision signal was 12,202 rows of "emit this value" and not one row of "emit
+    # nothing" -- while 18,960 rows of the mix, 63.7% of it, silently contributed nothing.
+    #
+    # That is why ``param_exact_match_none`` is 0.0000 on every held-out set ever measured: it is not a model
+    # defect, it is a supervision gap. **A head that must always emit is useless to the reflex path**, because
+    # most real requests have no parameter to emit.
+    #
+    # The distinction below is the whole point, and it is why the two cases must not be merged. A row that has *no*
+    # target has silence as its correct answer, so silence is supervised. A row that *has* a target which the
+    # request does not contain still stays masked: the answer exists but is not visible in the input, so teaching
+    # silence there would teach a falsehood, and that is the old-source prior the flag above exists to prevent.
+    silence_supervised = [not (str(param_strs[b] or "")) for b in range(len(examples))]
+
+    #: ROUND 117. The mask above removes every row whose target is not verbatim in the request, which is the
+    #: right test for a *value* (the planner names it) and structurally unsatisfiable for a *chunk* (a block of
+    #: code never appears verbatim in a natural-language request). MEASURED in 13.48: 12,318 tierA train rows,
+    #: 38.9% of the tier and the largest emission signal available, were masked on that unsatisfiable test, so
+    #: only 356 rows -- 1.1% -- could teach the parameter head to emit anything. And the product asks for exactly
+    #: that class: 7 of the 31 benchmark scenarios expect chunk emissions, six of them single-line short code.
+    #:
+    #: So a chunk is unmasked when two measured conditions hold: it fits the decoder budget, and it is not a
+    #: verbatim span of the old source. The first is 85.8% of chunks (p50 12 tokens, p90 40, p99 148 against a
+    #: 31-token budget) and the second is 92.4% -- measured, not assumed. The second condition is what keeps this
+    #: from re-admitting the old-source prior the flag exists to prevent: only 7.6% of chunk targets appear
+    #: verbatim in ``old_source``, so emitting old-source text is wrong 92.4% of the time and supervising these
+    #: rows actively punishes it.
+    #:
+    #: Rows that are neither answerable nor fittable nor non-copied stay masked. Silence supervision above is
+    #: untouched: a chunk row is never taught silence.
+    budget = max(0, p_max - 1)
+    fits_budget = [False] * len(examples)
+    if any(param_strs):
+        probe = tok.encode_batch([str(s or "") for s in param_strs], 4096)
+        fits_budget = [len(ids) <= budget for ids in probe]
+    old_sources = [str(ex.get("old_source") or "") for ex in examples]
+
     answerable_only = bool(getattr(cfg, "param_answerable_only", True))
     if answerable_only:
         for b, ex in enumerate(examples):
-            if param_strs[b] and not param_answerable(ex):
-                param_strs[b] = ""
+            if not param_strs[b] or param_answerable(ex):
+                continue
+            target = str(param_strs[b])
+            if fits_budget[b] and target not in old_sources[b]:
+                continue  # a learnable chunk -- supervise it rather than dropping the row
+            param_strs[b] = ""
     encoded = tok.encode_batch(param_strs, p_max)
     #: Every non-empty target is terminated with ``<eos>``, and the terminator is
     #: supervised (it sits inside ``param_mask``).  Without it "when to stop" has
@@ -569,8 +615,11 @@ def collate(
     #: tokens and then never stops).  One slot is reserved for the terminator so
     #: widening ``max_params`` cannot silently evict it.
     encoded = [
-        (ids[: max(0, p_max - 1)] + [tok.eos_id]) if ids else []
-        for ids in encoded
+        (ids[: max(0, p_max - 1)] + [tok.eos_id]) if ids
+        # ROUND 115. A lone ``<eos>`` is supervision for "stop before emitting anything". Without it the
+        # no-target rows contributed nothing and the head learned to always speak.
+        else ([tok.eos_id] if silence_supervised[b] else [])
+        for b, ids in enumerate(encoded)
     ]
     P = max(1, max((len(e) for e in encoded), default=0))
     param_ids = torch.full((B, P), tok.pad_id, dtype=torch.long)

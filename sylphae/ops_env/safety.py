@@ -67,12 +67,27 @@ _DESTRUCTIVE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 
 #: A regex an argument must not contain even as a substring -- the ``..`` escape
 #: and the recursive-delete flags, which are dangerous in any position.
+#:
+#: MEASURED 2026-10-02: the ``~`` rule was a bare substring match, and on Windows it refused
+#: legitimate work. ``C:\Users\ELIOWA~1\AppData\Local\Temp\env_census_xxx`` contains a ``~``
+#: because 8.3 short names abbreviate long ones that way, so *every* command under a short
+#: user profile was refused as "expanding the user's home". The census showed it as
+#: ``venv_create refused at command: forbidden-substring: ~`` -- a real action blocked by a
+#: safety rule that could not tell a home expansion from a short filename.
+#:
+#: The fix narrows the rule to what it was for: a tilde that *starts a path token*. ``~``,
+#: ``~/x``, ``~\\x`` and ``--home=~/x`` still refuse; ``ELIOWA~1`` does not. Anchoring to a
+#: token boundary is the difference between refusing the construct and refusing a character,
+#: and the construct is the actual hazard -- an unexpanded home is ambiguous about whose home,
+#: and that is what the rule exists to prevent.
 _FORBIDDEN_SUBSTRINGS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"\.\./",
         r"\.\.\\",
-        r"~",  # never expand the user's home implicitly
+        # A tilde that begins a path token, or follows a flag/value separator. Deliberately
+        # anchored: see the note above about 8.3 short names.
+        r"(?:^|[\s\"'=:])~(?:$|[/\s\"'])",
     )
 )
 

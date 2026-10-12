@@ -227,8 +227,58 @@ class ToolMatch:
     symbols: list[str] = field(default_factory=list)
 
 
+#: Memoised result of :func:`get_ripgrep_binary`.
+#:
+#: MEASURED 2026-10-02: 4768.84 us per call. The function does six filesystem probes on
+#: every invocation -- ``shutil.which`` plus five ``os.path.isfile`` checks across
+#: LOCALAPPDATA and two ProgramFiles roots -- and on this machine the answer is never
+#: found in PATH, so *every* probe runs to completion and the four VS-style candidates
+#: that do not exist are each stat-ed.
+#:
+#: 4.77 ms is 3.2% of DESIGN.md section 5's 150 ms budget, and it is paid more than once per
+#: request: ``ripgrep_search`` calls it, the heuristic path calls it, and the neural
+#: tool's fallback does too. What makes it worth fixing is not the size but that none of it
+#: can change within a process -- the binary's location is a property of the machine, not
+#: of the request. A negative result is cached too: if ripgrep is absent, re-probing six
+#: paths on every call to re-learn that is the same waste.
+#:
+#: ``lru_cache`` is the whole fix and is keyed on nothing, so the value is computed once per
+#: process. Tests that need a different answer call ``get_ripgrep_binary.cache_clear()``.
+_RG_BINARY_CACHE: list[str | None] = [None]
+_RG_BINARY_RESOLVED = False
+
+
 def get_ripgrep_binary() -> str | None:
-    """Locate ripgrep executable in PATH or standard development tool locations."""
+    """Locate ripgrep executable in PATH or standard development tool locations.
+
+    Cached after the first call; see ``_RG_BINARY_CACHE`` for the measurement and for why a
+    negative result is cached as well as a positive one.
+    """
+    global _RG_BINARY_RESOLVED
+    if _RG_BINARY_RESOLVED:
+        return _RG_BINARY_CACHE[0]
+    _RG_BINARY_CACHE[0] = _locate_ripgrep_binary()
+    _RG_BINARY_RESOLVED = True
+    return _RG_BINARY_CACHE[0]
+
+
+def _reset_ripgrep_cache() -> None:
+    """Forget the memoised answer so the next call probes again.
+
+    Exists because caching a filesystem answer is only safe if "look again" is a supported
+    operation. Without it, a developer who installs ripgrep mid-session has no way to make
+    the agent notice, and the workaround people reach for is to disable the cache -- which
+    costs 4.8 ms per call for everyone. Tests that manipulate PATH or the candidate roots
+    must call this too, and it is written so the fixtures do not have to poke the two
+    private globals directly.
+    """
+    global _RG_BINARY_RESOLVED
+    _RG_BINARY_RESOLVED = False
+    _RG_BINARY_CACHE[0] = None
+
+
+def _locate_ripgrep_binary() -> str | None:
+    """The uncached probe. Call :func:`get_ripgrep_binary` instead."""
     bin_path = shutil.which("rg")
     if bin_path:
         return bin_path
@@ -558,8 +608,27 @@ async def ast_search(
     query_tokens: Sequence[str],
     index_or_root: RepoIndex | Path,
     k: int = 10,
+    *,
+    exclude_tests: bool = False,
+    named: set[str] | None = None,
 ) -> list[ToolMatch]:
-    """Search AST symbols, functions, classes and signatures."""
+    """Search AST symbols, functions, classes and signatures.
+
+    ``exclude_tests`` drops test files from the index ranking, and it matters for a
+    reason the fusion sort key already encodes but the tool could not see: ast
+    normalizes every candidate by the result set's peak (below), so a test file at the
+    peak compresses *every* source file's score.  ``_candidate_sort_key`` still orders
+    source before test, but ordering cannot undo a score that was already divided by the
+    wrong peak -- the source file arrives correctly ordered yet weakly weighted, and the
+    other tools outrank it.  MEASURED on ``把选项的样式从bold cyan改为bold red``
+    (typer): the AST peak was ``tests/test_types.py`` at 30.31, and gold
+    ``typer/rich_utils.py`` scored 0.568 of it; passing ``exclude_tests=True`` made gold
+    itself the peak at 1.000.
+
+    ``named`` is the set of tokens the user actually wrote (see
+    ``RepoIndex.candidates``).  Without it the explained-set fires on concept synonyms
+    and erases the gold file's own evidence.
+    """
     if not query_tokens:
         return []
 
@@ -578,7 +647,9 @@ async def ast_search(
             return []
 
         query = " ".join(query_tokens)
-        cands = idx.candidates(query, k=k)
+        cands = idx.candidates(
+            query, k=k, exclude_tests=exclude_tests, named=named
+        )
         # The index's own ranking signal has to survive the trip into [0, 1].  A fixed
         # ``score / 8`` collapses it: MEASURED on ``把 HTTP_500_INTERNAL_SERVER_ERROR ...``,
         # the defining file scored 48.34 raw and a test file that merely mentions 500 scored

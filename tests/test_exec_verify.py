@@ -30,7 +30,11 @@ import sylphae.exec.verify as verify_mod  # noqa: E402
 from sylphae.exec.verify import (  # noqa: E402
     VerifyReport,
     _parse_pytest_counts,
+    _parse_pytest_outcomes,
     affected_tests,
+    diff_outcomes,
+    pytest_outcomes,
+    select_tests_within_budget,
     verify,
 )
 
@@ -305,6 +309,92 @@ def test_affected_tests_accepts_absolute_and_backslash_paths(pkg: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# bounded test selection
+# --------------------------------------------------------------------------------------
+#
+# ``affected_tests`` is allowed to answer "everything" when it cannot map a change to a
+# specific suite. On a large repository that answer turns a one-line edit into a
+# full-repository pytest run, which is killed at the timeout and then reports *nothing
+# verified* -- indistinguishable, in the rate, from a scenario whose tests all passed.
+# MEASURED on tiangolo__typer: one line in typer/_click/formatting.py maps to 228 test
+# files by the import graph alone. The cap fixes the cost, and returning the dropped
+# count is what stops the fix from hiding the coverage instead of reporting it.
+
+
+def test_budget_keeps_everything_when_the_affected_set_fits(pkg: Path) -> None:
+    selected, dropped = select_tests_within_budget(
+        pkg, ["mypkg/core.py"], ALL_TESTS, 10)
+    assert selected == affected_tests(pkg, ["mypkg/core.py"], ALL_TESTS)
+    assert dropped == 0
+
+
+def test_budget_caps_and_reports_what_it_dropped(pkg: Path) -> None:
+    many = [f"tests/test_mod{i}.py" for i in range(40)]
+    for rel in many:
+        _write(pkg / rel, "from mypkg.core import add\n\n\ndef test_a():\n    assert add(1, 1) == 2\n")
+
+    selected, dropped = select_tests_within_budget(pkg, ["mypkg/core.py"], many, 12)
+
+    assert len(selected) == 12
+    assert dropped == 28
+    # The dropped count is the whole point: a caller that cannot say "12 of 40" cannot
+    # report a test_pass_rate for this scenario honestly.
+    assert len(selected) + dropped == 40
+
+
+def test_budget_is_deterministic(pkg: Path) -> None:
+    """Same input, same answer -- otherwise two runs are not comparable."""
+    many = [f"tests/test_mod{i}.py" for i in range(30)]
+    for rel in many:
+        _write(pkg / rel, "from mypkg.core import add\n\n\ndef test_a():\n    assert add(1, 1) == 2\n")
+
+    first = select_tests_within_budget(pkg, ["mypkg/core.py"], many, 5)
+    second = select_tests_within_budget(pkg, ["mypkg/core.py"], many, 5)
+    assert first == second
+
+
+def test_a_zero_budget_disables_the_cap_rather_than_selecting_nothing(pkg: Path) -> None:
+    """``--max-tests 0`` means "no cap". Returning [] would read as 'nothing to run'."""
+    selected, dropped = select_tests_within_budget(
+        pkg, ["mypkg/core.py"], ALL_TESTS, 0)
+    assert selected == affected_tests(pkg, ["mypkg/core.py"], ALL_TESTS)
+    assert dropped == 0
+
+
+def test_a_capped_run_of_real_tests_still_executes_them(pkg: Path) -> None:
+    """The cap is a selection change, not a way to make verification vacuous."""
+    many = [f"tests/test_mod{i}.py" for i in range(20)]
+    for rel in many:
+        _write(pkg / rel, "from mypkg.core import add\n\n\ndef test_a():\n    assert add(1, 1) == 2\n")
+
+    selected, dropped = select_tests_within_budget(pkg, ["mypkg/core.py"], many, 4)
+    report = verify(pkg, ["mypkg/core.py"], selected)
+
+    assert dropped == 16
+    assert report.tests_run == 4
+    assert report.tests_passed == 4
+    assert report.errors == []
+
+
+def test_a_capped_run_that_fails_still_reports_the_failure(pkg: Path) -> None:
+    """Capping must not turn a broken change into a green one."""
+    many = [f"tests/test_mod{i}.py" for i in range(20)]
+    for i, rel in enumerate(many):
+        expected = 3 if i == 0 else 2
+        _write(pkg / rel,
+               "from mypkg.core import add\n\n\ndef test_a():\n"
+               f"    assert add(1, 1) == {expected}\n")
+
+    selected, _ = select_tests_within_budget(pkg, ["mypkg/core.py"], many, 4)
+    report = verify(pkg, ["mypkg/core.py"], selected)
+
+    assert report.tests_run == 4
+    assert report.tests_passed == 3
+    assert report.clean is False
+
+
+
+# --------------------------------------------------------------------------------------
 # pytest output parsing
 # --------------------------------------------------------------------------------------
 
@@ -330,3 +420,122 @@ def test_parse_pytest_counts_ignores_count_words_inside_tracebacks() -> None:
         "1 failed in 0.10s\n"
     )
     assert _parse_pytest_counts(output) == {"failed": 1}
+
+
+# --------------------------------------------------------------------------------------
+# per-test outcomes and the before/after diff
+# --------------------------------------------------------------------------------------
+#
+# Aggregate counts cannot answer "did the patch break something": 145/170 before and 146/171
+# after is consistent with zero regressions and equally with one regression and one fix.
+# The vendored snapshots are not green to begin with (rich 232/240, pluggy 145/170), so
+# the diff is not a nicety either -- it is the only form of the question that is fair.
+
+_VERBOSE = """\
+============================= test session starts ==============================
+platform win32 -- Python 3.13.0, pytest-8.0.0
+collected 3 items
+
+tests/test_a.py::test_ok PASSED                                      [ 33%]
+tests/test_a.py::test_bad FAILED                                      [ 66%]
+tests/test_b.py::test_skipped SKIPPED (x)                             [100%]
+
+========================= 1 failed, 1 passed, 1 skipped ========================
+"""
+
+
+def test_parse_pytest_outcomes_reads_node_ids() -> None:
+    assert _parse_pytest_outcomes(_VERBOSE) == {
+        "tests/test_a.py::test_ok": "PASSED",
+        "tests/test_a.py::test_bad": "FAILED",
+        "tests/test_b.py::test_skipped": "SKIPPED",
+    }
+
+
+def test_parse_pytest_outcomes_ignores_non_test_lines() -> None:
+    """A traceback mentioning a test path is not an outcome line.
+
+    The node-id pattern is anchored and requires an outcome keyword, so summary lines and
+    failure bodies cannot masquerade as results.
+    """
+    noisy = (
+        "tests/test_a.py::test_ok PASSED                    [ 50%]\n"
+        "E   tests/test_a.py::test_other AssertionError\n"
+        "_______ test_something _______\n"
+    )
+    assert _parse_pytest_outcomes(noisy) == {"tests/test_a.py::test_ok": "PASSED"}
+
+
+def test_parse_pytest_outcomes_on_unparseable_output_is_empty_not_a_pass() -> None:
+    """Empty means unknown, and unknown is never 'everything passed'."""
+    assert _parse_pytest_outcomes("") == {}
+    assert _parse_pytest_outcomes("ImportError while loading conftest") == {}
+
+
+def test_diff_reports_a_green_to_red_move() -> None:
+    before = {"t.py::a": "PASSED", "t.py::b": "PASSED"}
+    after = {"t.py::a": "FAILED", "t.py::b": "PASSED"}
+    regressions, fixed = diff_outcomes(before, after)
+    assert regressions == ["t.py::a"]
+    assert fixed == []
+
+
+def test_diff_does_not_charge_a_preexisting_failure() -> None:
+    """The case that makes the diff necessary rather than merely thorough.
+
+    MEASURED 2026-10-01 with no patch applied: Textualize__rich runs 232/240 and
+    pytest-dev__pluggy runs 145/170. An absolute rule calls those 16 tests a failure of
+    the agent's patch.
+    """
+    before = {"t.py::a": "PASSED", "t.py::already_broken": "FAILED"}
+    after = {"t.py::a": "PASSED", "t.py::already_broken": "FAILED"}
+    assert diff_outcomes(before, after) == ([], [])
+
+
+def test_diff_treats_skip_and_xfail_as_green() -> None:
+    """Neither is a broken tree, so neither can be a regression."""
+    before = {"t.py::s": "SKIPPED", "t.py::x": "XFAIL", "t.py::p": "PASSED"}
+    after = {"t.py::s": "SKIPPED", "t.py::x": "XFAIL", "t.py::p": "PASSED"}
+    assert diff_outcomes(before, after) == ([], [])
+
+    # ...and a skipped test turning red *is* a move worth reporting.
+    after_xfail_failed = {"t.py::s": "SKIPPED", "t.py::x": "PASSED", "t.py::p": "PASSED"}
+    regressions, _ = diff_outcomes(before, after_xfail_failed)
+    assert regressions == []
+
+
+def test_diff_reports_a_test_that_became_green() -> None:
+    """Recorded because a patch that only ever reports regressions looks the same as one
+    that did nothing."""
+    before = {"t.py::a": "FAILED"}
+    after = {"t.py::a": "PASSED"}
+    regressions, fixed = diff_outcomes(before, after)
+    assert regressions == []
+    assert fixed == ["t.py::a"]
+
+
+def test_diff_ignores_tests_absent_from_either_side() -> None:
+    """A test that stopped being collected is not a regression, and a test the patch
+    added is not one either. A vanished test shows up as a collection error on the
+    ``after`` side, which is where it belongs."""
+    before = {"t.py::a": "PASSED", "t.py::gone": "PASSED"}
+    after = {"t.py::a": "PASSED", "t.py::added": "PASSED"}
+    assert diff_outcomes(before, after) == ([], [])
+
+
+def test_diff_on_an_empty_baseline_verifies_nothing_in_either_direction() -> None:
+    """No baseline means no verdict -- not a clean one and not a fixed one.
+
+    A test absent from ``before`` is ignored rather than assumed to have just passed,
+    because "it passed after the patch" is not a claim that can be made about a test the
+    baseline never ran. Compare ``test_diff_reports_a_test_that_became_green``, where the
+    test *was* in the baseline and red.
+    """
+    assert diff_outcomes({}, {"t.py::a": "PASSED"}) == ([], [])
+    assert diff_outcomes({}, {"t.py::a": "FAILED"}) == ([], [])
+
+
+def test_pytest_outcomes_reports_a_missing_suite_rather_than_raising(tmp_path: Path) -> None:
+    outcomes, errors = pytest_outcomes(tmp_path, [])
+    assert outcomes == {}
+    assert any(e.startswith("no-tests:") for e in errors), errors

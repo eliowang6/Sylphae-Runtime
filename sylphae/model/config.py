@@ -76,6 +76,23 @@ class ModelConfig:
     #: the same config object the model is built from.
     ctx_tokens: int = 0
 
+    #: Whether the param head is conditioned on the op the op head chose.
+    #:
+    #: ROUND 152. Both heads read the same ``pooled`` and neither sees the other, so
+    #: the param head cannot know whether the chosen op carries a value at all --
+    #: and the op kind is the only thing that determines that.  MEASURED on Tier A:
+    #: 54.5% of rows supervise a *lone* ``<eos>``, the modal supervised width is 1
+    #: token, and at product level 9 of 9 emissions are 1 to 4 characters while the
+    #: correct value sits verbatim in the request every time.  With the op visible the
+    #: head stops having to learn that marginal.
+    #:
+    #: **Off by default.**  It adds no parameters -- the conditioning vector is
+    #: ``op_head.weight[argmax(op_logits)]``, a row the op head already learned -- so
+    #: ``runs/iter34`` still loads unchanged.  But no retrain has ever trained the
+    #: head to use the signal, so turning it on changes behaviour unmeasured.  It
+    #: stays off until a retrain shows it helps.
+    op_cond: bool = False
+
     # ---- misc ------------------------------------------------------------
     dropout: float = 0.0
     grad_checkpoint: bool = False

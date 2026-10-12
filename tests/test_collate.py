@@ -284,7 +284,11 @@ def test_inference_shaped_example_collapses_to_one_param_slot(tiny_tokenizer):
     ex = make_example(0, request="把服务端口修改为9000", props={})
     b = collate([ex], tiny_tokenizer, None, cfg)
     assert b.param_ids.shape[1] == 1
-    assert int(b.param_mask[0].sum()) == 0
+    # ROUND 115. This was 0, and it was wrong. The shape here is genuinely "no answer", so the row is now
+    # supervised with a lone <eos> -- silence is the correct answer and has to be taught. The width above is
+    # unchanged: still one slot, and `generate_params` must still not read it (see test_policy.py).
+    assert int(b.param_mask[0].sum()) == 1
+    assert int(b.param_ids[0][0]) == tiny_tokenizer.eos_id
 
 
 def test_conf_labels_structured_vs_freeform(tiny_tokenizer):

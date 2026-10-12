@@ -434,31 +434,58 @@ def test_generate_params_shape():
     model = SylphaeModel(cfg).eval()
     b = make_batch(B=3, L=8, C=2, P=6, vocab=cfg.vocab_size)
     ids = model.generate_params(b)
-    # cfg.max_params, NOT the batch's P=6: the decode width must not be the width
-    # of the answer.  ``batch.param_ids`` is the *gold* encoding, so decoding at its
-    # width hands the model the length of the string it is being scored on --
-    # measured on iter32, the same checkpoint scored 0.7775 param_exact_match_value
-    # at the gold width while the agent's inference example (empty props) collapsed
-    # that width to 1 and returned every multi-token value as its own first token.
+    # cfg.max_params, NOT the batch's P=6 -- see the width test below.
     assert ids.shape == (3, cfg.max_params)
     assert ids.min() >= 0 and ids.max() < cfg.vocab_size
 
 
 def test_generate_params_width_comes_from_the_config_not_the_gold():
-    """The decode width is the model's capacity, never the gold's length.
+    """The decode width must not be the width of the answer.
 
-    The two numbers are different measurements: one is the product's behaviour, the
-    other is the answer's shape handed back to the model.
+    ``batch.param_ids`` *is* the gold encoding, so decoding at its width hands the
+    model the length of the string it is being scored on.  At inference there is
+    no gold -- the agent's example carries empty props -- the width collapses to
+    1, and every multi-token value came back as its own first token.  MEASURED on
+    iter32: 3 of 6 reachable scenarios exact at the collapsed width
+    (``60``/``16``/``5`` right, ``9000``->``9``, ``410``->``4``, ``120``->``1``),
+    while the held-out ``param_exact_match_value`` of 0.7775 was scored at the
+    gold width.  Two numbers from one checkpoint, and only the narrower one
+    described the product.
     """
     cfg = tiny_cfg()                      # max_params=8
     torch.manual_seed(0)
     model = SylphaeModel(cfg).eval()
     narrow = make_batch(B=2, L=12, C=2, P=1, vocab=cfg.vocab_size)
     wide = make_batch(B=2, L=12, C=2, P=6, vocab=cfg.vocab_size)
+    assert narrow.param_ids.shape[1] == 1 and wide.param_ids.shape[1] == 6
     assert model.generate_params(narrow).shape == (2, cfg.max_params)
     assert model.generate_params(wide).shape == (2, cfg.max_params)
     # an explicit width still wins, for a caller that bounds the decode
     assert model.generate_params(wide, max_len=3).shape == (2, 3)
+
+
+def test_generate_freezes_a_finished_row_on_pad():
+    """A row that emitted the terminator stops; nothing is appended after it.
+
+    With the decode width now ``cfg.max_params`` (64 in production) rather than
+    the gold's, an unconditional loop would emit junk after the value -- which is
+    what iter32 did at width 64 (``"9000090000000..."``, 0 of 6 exact).  Freezing
+    finished rows is also what keeps the reflex latency proportional to the
+    value's length instead of to ``max_params``.
+    """
+    from sylphae.model.policy import ParamDecoder  # noqa: PLC0415
+
+    dec = ParamDecoder(d_model=8, hidden=8, emb_dim=4, vocab_size=32,
+                       bos_id=1, pad_id=0, eos_id=2).eval()
+    with torch.no_grad():
+        # force every step's argmax onto <eos>
+        dec.out.weight.zero_()
+        dec.out.bias.zero_()
+        dec.out.bias[2] = 10.0
+    ids = dec.generate(torch.zeros(2, 8), max_len=16)
+    assert ids.shape == (2, 16)
+    assert ids[:, 0].tolist() == [2, 2], "the first emitted token is the terminator"
+    assert (ids[:, 1:] == 0).all(), "a finished row emits pad, never junk after it"
 
 
 def test_generate_params_stops_changing_on_repeat():

@@ -33,6 +33,8 @@ Usage
 
 from __future__ import annotations
 
+from sylphae.stats import percentile_or_none
+
 import argparse
 import io
 import json
@@ -191,14 +193,17 @@ def materialise(repo_dir: Path, sha: str, dest: Path) -> int:
 
 
 def percentile(values: list[float], q: float) -> float | None:
-    """Nearest-rank percentile. ``None`` for an empty sample, never ``0.0``."""
-    if not values:
-        return None
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    idx = int(round((q / 100.0) * (len(ordered) - 1)))
-    return ordered[max(0, min(idx, len(ordered) - 1))]
+    """Linear-interpolation percentile. ``None`` for an empty sample, never ``0.0``.
+
+    **This changed definition, and the reported numbers with it.** It used to be
+    nearest-rank: for ``[1, 2, 3, 4]`` it returned ``2`` at q=50, while
+    :mod:`sylphae.eval.bench_latency` returned ``2.5``. One dataset, two p95s, depending
+    on which evaluator reported it. It now shares the single definition in
+    :mod:`sylphae.eval.stats` -- the one pinned by hand-computed tests in
+    ``tests/test_eval_bench_latency.py`` -- and keeps only this module's ``None``-on-empty
+    reporting contract, which the shared function deliberately does not have.
+    """
+    return percentile_or_none(values, q)
 
 
 def _summary(values: list[float]) -> dict[str, float | None]:

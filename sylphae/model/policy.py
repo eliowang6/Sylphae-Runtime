@@ -184,6 +184,7 @@ class ParamDecoder(nn.Module):
         bos_id: int,
         pad_id: int,
         eos_id: int,
+        op_cond_n: int | None = None,
     ):
         super().__init__()
         self.hidden = hidden
@@ -192,6 +193,19 @@ class ParamDecoder(nn.Module):
         self.eos_id = eos_id
         self.ctx_proj = nn.Linear(d_model, hidden)
         self.req_proj = nn.Linear(d_model, hidden)
+        #: ROUND 153. A learned per-op vector added to the decode context *after*
+        #: ``ctx_proj``, so the decoder reads it directly.  The first attempt added
+        #: ``op_head.weight[op]`` to ``pooled`` *before* ``ctx_proj``, and an A/B on
+        #: iter34 measured **zero** effect (identical emissions, 0 of 57 exact on
+        #: rows that should carry a value): ``ctx_proj`` is already trained and
+        #: flattens a perturbation added ahead of it.  Injecting here is the only
+        #: place the decoder can learn to read the signal.
+        #:
+        #: Built **only** when ``op_cond_n`` is given, so a default run keeps the
+        #: exact parameter set of every existing checkpoint -- ``load_weights``
+        #: refuses any key-set difference, and an unconditional module would make
+        #: every recorded run unloadable.
+        self.op_emb = nn.Embedding(op_cond_n, hidden) if op_cond_n else None
         self.emb = nn.Embedding(vocab_size, emb_dim)
         self.inp = nn.Linear(emb_dim, hidden)
         self.pos = nn.Embedding(PARAM_DEC_MAX_POS, hidden)
@@ -201,8 +215,11 @@ class ParamDecoder(nn.Module):
         self.norm = nn.LayerNorm(hidden)
         self.out = nn.Linear(hidden, vocab_size)
 
-    def _initial(self, pooled: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.ctx_proj(pooled))
+    def _initial(self, pooled: torch.Tensor, op_id: torch.Tensor | None = None) -> torch.Tensor:
+        ctx = torch.tanh(self.ctx_proj(pooled))
+        if self.op_emb is not None and op_id is not None:
+            ctx = ctx + self.op_emb(op_id)
+        return ctx
 
     @staticmethod
     def _causal_mask(P: int, device, dtype) -> torch.Tensor:
@@ -215,6 +232,7 @@ class ParamDecoder(nn.Module):
         prev: torch.Tensor,
         req_tokens: torch.Tensor | None,
         req_mask: torch.Tensor | None,
+        op_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, P = prev.shape
         if P > PARAM_DEC_MAX_POS:
@@ -224,7 +242,7 @@ class ParamDecoder(nn.Module):
             )
         ar = torch.arange(P, device=prev.device)
         x = self.inp(self.emb(prev)) + self.pos(ar).unsqueeze(0)
-        x = x + self._initial(pooled).unsqueeze(1)
+        x = x + self._initial(pooled, op_id).unsqueeze(1)
 
         if req_tokens is not None and req_tokens.shape[1] > 0:
             req = self.req_proj(req_tokens)
@@ -255,6 +273,7 @@ class ParamDecoder(nn.Module):
         param_ids: torch.Tensor,
         req_tokens: torch.Tensor | None = None,
         req_mask: torch.Tensor | None = None,
+        op_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Teacher-forced logits, shape (B, P, vocab_size).
 
@@ -264,7 +283,7 @@ class ParamDecoder(nn.Module):
         prev = torch.cat(
             [param_ids.new_full((B, 1), self.bos_id), param_ids[:, :-1]], dim=1
         )
-        return self._run(pooled, prev, req_tokens, req_mask)
+        return self._run(pooled, prev, req_tokens, req_mask, op_id)
 
     @torch.no_grad()
     def generate(
@@ -273,6 +292,7 @@ class ParamDecoder(nn.Module):
         max_len: int,
         req_tokens: torch.Tensor | None = None,
         req_mask: torch.Tensor | None = None,
+        op_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Greedy decode, shape (B, max_len).
 
@@ -295,7 +315,7 @@ class ParamDecoder(nn.Module):
             if bool(done.all()):
                 break
             prefix = torch.cat([bos, out[:, :t]], dim=1)
-            logits = self._run(pooled, prefix, req_tokens, req_mask)
+            logits = self._run(pooled, prefix, req_tokens, req_mask, op_id)
             nxt = logits[:, -1].argmax(dim=-1)
             nxt = torch.where(done, torch.full_like(nxt, self.pad_id), nxt)
             out[:, t] = nxt
@@ -468,6 +488,9 @@ class SylphaeModel(nn.Module):
             bos_id=BOS_ID,   # INTERFACES.md section 4: the frozen special-token order
             pad_id=PAD_ID,
             eos_id=EOS_ID,
+            # ROUND 153. Only built when the flag is on, so a default run keeps the
+            # exact parameter set of every recorded checkpoint.
+            op_cond_n=int(cfg.n_ops) if getattr(cfg, "op_cond", False) else None,
         )
 
     # -- forward -----------------------------------------------------------
@@ -690,10 +713,15 @@ class SylphaeModel(nn.Module):
         )
         target_logits = target_logits.masked_fill(~batch.cand_mask, _MASK_FILL)
 
+        op_logits = self.op_head(pooled)
+
         return PolicyOutput(
             target_logits=target_logits,
-            op_logits=self.op_head(pooled),
-            param_logits=self.param_decoder(pooled, batch.param_ids, req_tokens, req_mask),
+            op_logits=op_logits,
+            param_logits=self.param_decoder(
+                pooled, batch.param_ids, req_tokens, req_mask,
+                op_logits.argmax(dim=-1) if self.param_decoder.op_emb is not None else None,
+            ),
             confidence=torch.sigmoid(self.conf_head(pooled).squeeze(-1)),
             mem_write=torch.sigmoid(self.mem_head(pooled).squeeze(-1)),
         )
@@ -727,4 +755,6 @@ class SylphaeModel(nn.Module):
         if hidden.shape[1] > 1:
             req_tokens, req_mask, _cand_tokens, _cand_mask = self._token_grids(batch, hidden)
         P = int(self.cfg.max_params) if max_len is None else int(max_len)
-        return self.param_decoder.generate(pooled, P, req_tokens, req_mask)
+        _op_id = (self.op_head(pooled).argmax(dim=-1)
+                  if self.param_decoder.op_emb is not None else None)
+        return self.param_decoder.generate(pooled, P, req_tokens, req_mask, _op_id)

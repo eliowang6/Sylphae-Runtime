@@ -147,6 +147,13 @@ def test_the_shared_definitions_both_sides_need_are_outside_both() -> None:
         "ops/params.py": "runtime -> data (the param-label predicates)",
         "model/io.py": "runtime -> train (the checkpoint reader)",
         "model/decode.py": "runtime -> eval (the param decoder)",
+        # runtime -> eval, for the percentile/latency-summary definitions. Added because
+        # sylphae/repo/bench_recall.py (shipped in the runtime) and
+        # sylphae/eval/bench_latency.py both needed ``percentile`` and had each defined
+        # it -- with different semantics, so one dataset produced two p95s. Putting the
+        # shared definition under eval/ would have broken rule 2, which is why it lives
+        # at the top level.
+        "stats.py": "runtime -> eval (the shared percentile definition)",
     }
     for name, why in shared.items():
         path = SRC / name

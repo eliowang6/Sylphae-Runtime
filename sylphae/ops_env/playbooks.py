@@ -45,6 +45,39 @@ _TRACEBACK_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (.+)$', re
 _PORT_BINDING_RE = re.compile(r"(?:Address already in use|Errno 10048|bind\(\).*10048)", re.I)
 
 
+def _under(cwd: Path, value: object) -> Path:
+    """A context-supplied path, resolved against the tree being operated on.
+
+    ROUND 13, and this fixes a defect the material map surfaced rather than one anybody reported.
+    Every playbook already did ``cwd = Path(symptom.context.get("cwd") or symptom.cwd)``, so the
+    *tree* was right. But the individual path values in ``context`` were passed to ``Path()``
+    raw, and a relative one is then resolved against **the process's** working directory -- not
+    the symptom's. Two things went wrong, and the second is the reason this is a fix rather than
+    a tidiness change:
+
+    * ``requirements: "requirements.txt"`` failed its ``exists()`` check while the command the
+      playbook went on to authorise would have run with ``cwd`` set to the symptom's tree. The
+      existence check and the authorised command disagreed about what a relative path means, so
+      the playbook escalated on input it would itself have accepted.
+    * ``tests_dir: "tests"`` resolved to *this repository's* ``tests`` directory, and
+      ``affected-tests`` globs it to build a test inventory. It came back holding
+      ``D:\\work\\Fae\\tests\\test_agent_model_wiring.py`` -- the agent's own test files -- and
+      tried to answer a question about a temp fixture with them, which raised
+      ``ValueError: 'tests\\test_agent_model_wiring.py' is not in the subpath of <fixture>``.
+
+    The second one is the serious direction: a relative path in an ops context made a playbook
+    read a tree it was never pointed at. A fix for it is not "document that callers should pass
+    absolute paths" -- a silent no-op when someone passes a relative one is exactly the shape of
+    bug that survives review. Resolving against ``cwd`` makes the commands and the checks agree,
+    and it makes the obvious call correct.
+
+    Deliberately not applied to ``test`` (a pytest node id, ``path::name`` -- not a path) or to
+    ``port`` (not a path at all).
+    """
+    p = Path(str(value))
+    return p if p.is_absolute() else cwd / p
+
+
 @dataclass
 class Symptom:
     """What the caller noticed.  ``kind`` selects the playbook."""
@@ -211,7 +244,7 @@ class PipConflictPlaybook(Playbook):
 
     def _run(self, symptom: Symptom, ex: EnvExecutor) -> PlaybookResult:
         cwd = Path(symptom.context.get("cwd") or symptom.cwd)
-        req_file = Path(symptom.context.get("requirements") or cwd / "requirements.txt")
+        req_file = _under(cwd, symptom.context.get("requirements") or "requirements.txt")
         result = PlaybookResult(
             category=self.category, resolved=False, evidence="", attempts=0
         )
@@ -536,7 +569,7 @@ class AffectedTestPlaybook(Playbook):
             result.escalation = "the caller must say which files changed"
             return result
         changed_paths = [Path(c) for c in changed]
-        tests_dir = Path(symptom.context.get("tests_dir") or cwd / "tests")
+        tests_dir = _under(cwd, symptom.context.get("tests_dir") or "tests")
         if not tests_dir.exists():
             result.resolved = True
             result.evidence = f"no tests directory at {tests_dir}; nothing to select"
@@ -692,7 +725,7 @@ class LintPlaybook(Playbook):
 
     def _run(self, symptom: Symptom, ex: EnvExecutor) -> PlaybookResult:
         cwd = Path(symptom.context.get("cwd") or symptom.cwd)
-        target = symptom.context.get("target") or symptom.context.get("file")
+        target = _under(cwd, symptom.context.get("target") or symptom.context.get("file"))
         result = PlaybookResult(
             category=self.category, resolved=False, evidence="", attempts=0
         )

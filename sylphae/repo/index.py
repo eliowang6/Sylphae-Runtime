@@ -1001,12 +1001,25 @@ class RepoIndex:
         )
 
     def candidates(
-        self, request: str, k: int = 8, exclude_tests: bool = False
+        self,
+        request: str,
+        k: int = 8,
+        exclude_tests: bool = False,
+        named: set[str] | None = None,
     ) -> list[Candidate]:
         """Rank files against a natural-language request. Deterministic.
 
         Returns ``min(k, eligible)`` candidates, so a short list is only ever caused by a
         small index (or by ``exclude_tests``), never by silent truncation.
+
+        ``named`` is the set of tokens the user *actually wrote*, as opposed to the ones a
+        synonym expansion contributed.  The explained-set (below) must only fire on the
+        former: MEASURED on ``把选项的样式从bold cyan改为bold red`` (typer), where the
+        concept synonyms ``option``/``style``/``css`` were exact symbol names elsewhere in
+        the repo and landed in ``explained``, suppressing every one of them for the gold
+        file and leaving it scoring on ``styles`` alone.  ``named`` defaults to the full
+        token set, which preserves the original behaviour for every caller that does not
+        distinguish.
         """
         if k <= 0 or not self._records:
             return []
@@ -1038,9 +1051,18 @@ class RepoIndex:
         # ``stderr`` inside its name refer to it -- crediting them to every file that
         # happens to share them is exactly what lets a pile of same-subtoken relatives
         # outrank the one file that defines the name.
+        #
+        # But the symbol has to have been *named*.  ``request_tokens`` also carries concept
+        # synonyms, and a synonym that happens to be an exact name somewhere --
+        # ``option``/``style``/``css`` for ``把选项的样式...`` -- is not a symbol the user
+        # asked for.  Letting it seed ``explained`` suppressed three of the four tokens the
+        # gold file scored on. MEASURED on typer: gold scored on ``styles`` alone and the
+        # AST rank was 6.
+        named_tokens = named if named is not None else request_tokens
         exact_names = {
             tok for tok in request_tokens
-            if any(tok in self._sym_names_lower[i] for i in eligible)
+            if tok in named_tokens
+            and any(tok in self._sym_names_lower[i] for i in eligible)
         }
         explained: set[str] = set()
         for name in exact_names:
@@ -1060,7 +1082,17 @@ class RepoIndex:
                 w = self._weight(tok, idf, max_idf)
                 if tok in sym_tokens and tok not in explained:
                     score += W_SYM * w
-                if tok in sym_names:
+                # The exact-name bonus is only for names the user *wrote*.  A concept
+                # synonym that merely collides with a symbol name is not a request for it:
+                # MEASURED on typer ``把选项的样式从bold cyan改为bold red``, where the
+                # ``样式`` -> ``css`` expansion met a CSS rule literally named ``css`` in
+                # ``docs/css/custom.css`` and collected W_SYM_EXACT*5.09 = 20.37 -- more
+                # than the whole ``option``/``options``/``style``/``styles`` signature of
+                # the gold file (17.35+13.22+8.75+5.14 = 44.46 vs 45.83), purely for
+                # sharing a three-letter name with the stylesheet.  ``exact_names`` adds
+                # the ``named`` requirement, so this is the condition the bonus was always
+                # meant to have; callers that do not pass ``named`` are unchanged.
+                if tok in exact_names and tok in sym_names:
                     score += W_SYM_EXACT * w
                 if tok in path_tokens and tok not in explained:
                     score += W_PATH * w

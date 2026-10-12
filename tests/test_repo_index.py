@@ -605,6 +605,36 @@ def test_a_cache_from_before_constants_were_symbols_is_rejected(
         RepoIndex.load(path)
 
 
+def test_load_rejects_a_cache_belonging_to_another_checkout(
+    tmp_path: Path, index: RepoIndex
+) -> None:
+    """A cache is keyed by filename, and the filename is identical in every checkout.
+
+    So a directory that was copied, moved, or cloned from a template arrives carrying
+    an index describing a *different* repository, whose file list names paths that do
+    not exist here.  MEASURED: ``work/real_projects/nextjs_dashboard/.sylphae_index.json``
+    predated the ``ecra`` -> ``sylphae`` rename and still listed ``.ecra_index.json`` as
+    a 1-line file whose symbol table was the whole repo's; two of the fourteen
+    real-world scenarios then located that nonexistent file and escalated with "No patch
+    could be constructed ... on '.ecra_index.json'" -- the agent editing its own cache.
+    Its schema version matched, so the root recorded in the payload is the only thing
+    that distinguishes it from a valid cache.
+    """
+    elsewhere = tmp_path / "a-different-checkout"
+    elsewhere.mkdir()
+    path = elsewhere / ".sylphae_index.json"
+    index.save(path)
+
+    with pytest.raises(ValueError, match="was built for"):
+        RepoIndex.load(path, expect_root=tmp_path / "this-checkout")
+
+    # ... and the matching case still loads, so the check is not simply refusing
+    # everything: a cache for *this* directory is exactly the thing it exists to serve.
+    same = tmp_path / ".sylphae_index.json"
+    RepoIndex.build(tmp_path).save(same)
+    assert RepoIndex.load(same, expect_root=tmp_path).files == RepoIndex.build(tmp_path).files
+
+
 # --------------------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------------------

@@ -63,6 +63,28 @@ _VALUE_PAIRS: tuple[tuple[str, str], ...] = (
 #: applier read ``text``, and the emission had no effect on the file at all.
 _CHUNK_PROP_KEYS: tuple[str, ...] = ("text", "new_text", "value", "to")
 
+#: Payload keys for ops that *add* something rather than substituting it.
+#:
+#: ROUND 104. An additive op has no "old value" by definition, so it can never satisfy
+#: ``_VALUE_PAIRS``, and it was therefore pushed onto the chunk fallback -- where ``text``
+#: is tried before ``value`` because ``text`` is the key the insert appliers read. MEASURED
+#: on ``corpus/tierA`` (first 20000 rows): ``add_list_element`` carries
+#: ``['line', 'text', 'value']`` and was given the chunk key ``text``, so the parameter
+#: target was a whole line of source; ``param_answerable`` is "is the target verbatim in the
+#: request", no request quotes a whole line, and **all seven of these kinds were
+#: structurally unanswerable** -- zero answerable rows among them in the entire tier.
+#:
+#: The value they should have emitted was in the props the whole time, in a key that
+#: ``_CHUNK_PROP_KEYS`` already lists but ranks below ``text``. This tuple promotes it for
+#: the no-pair case only, so a substitution op is untouched: its pair branch runs first and
+#: returns before this is reached.
+#:
+#: Deliberately **not** included: ``delete_statement`` and ``remove_import``. A deletion has
+#: no new value to emit, and asking the head for one would train it to invent text. They stay
+#: unanswerable, which is the honest outcome rather than a supervised row with no learnable
+#: target.
+_ADDITIVE_VALUE_KEYS: tuple[str, ...] = ("value", "arg")
+
 #: Every key ``param_target_string`` may choose, values before chunks.  The eval
 #: decoder mirrors this rule rather than importing it, so the eval layer keeps
 #: working under the end-to-end stub world; ``tests/test_iteration4.py`` pins the two
@@ -110,8 +132,18 @@ def param_target_key(props: dict) -> str | None:
             return new_key
         if substitute_value(props, new_key, old_key, str(props[new_key])) == props.get(
             "new_text"
-        ):
+              ):
             return new_key
+    # ROUND 104. The additive value path. Only reachable when no value pair is present, so
+    # every substitution op has already returned above and none of them is affected.
+    if not any(nk in props and ok in props for nk, ok in _VALUE_PAIRS):
+        for additive_key in _ADDITIVE_VALUE_KEYS:
+            value = props.get(additive_key)
+            # A non-empty string only. ``remove_import``'s ``modules`` is a list and is not
+            # in this tuple anyway; the isinstance check is here so a future key carrying a
+            # structure cannot make ``param_target_string`` return its repr.
+            if isinstance(value, str) and value.strip():
+                return additive_key
     for key in _CHUNK_PROP_KEYS:
         if key in props:
             return key

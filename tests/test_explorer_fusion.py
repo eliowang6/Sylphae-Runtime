@@ -169,3 +169,70 @@ async def test_the_fused_explorer_points_at_the_definition_not_the_test(tmp_path
     assert last[0].path == "src/navbar.py", (
         f"definition lost to a test file: {[m.path for m in last[:4]]}"
     )
+
+
+# --- the fused ranking must keep the ordering the tools already computed -------------
+#
+# MEASURED on runs/iter34: for pyv_rich_default_overflow ripgrep ranked rich/text.py 6th
+# of 15 on its own, the cross-tool fusion promoted tests/test_text.py to first, and the
+# agent edited the test. _rank_content_matches already sorts source-before-non-source and
+# code-before-test and documents why; the fusion re-sorted on the summed score alone and
+# discarded both keys.
+
+
+def _cand(path: str, score: float):
+    from sylphae.agent.explorer import CandidateResult
+
+    return CandidateResult(path=path, score=score, contributing_tools={"ripgrep"},
+                           snippet="", line=0, symbols=[])
+
+
+def test_a_source_file_beats_a_higher_scoring_test_file():
+    """The measured regression, as a unit: scores alone would pick the test."""
+    from sylphae.agent.explorer import _candidate_sort_key
+
+    test = _cand("tests/test_text.py", 0.90)
+    source = _cand("rich/text.py", 0.55)
+    assert _candidate_sort_key(source) < _candidate_sort_key(test)
+
+
+def test_a_non_source_file_never_outranks_a_source_file_however_well_it_matches():
+    """"Source" is POLYGLOT_EXTENSIONS, so .yml and .json count as source.
+
+    Worth stating because it looks like a bug otherwise: ``pyv_flake8_indent_size`` fails
+    with ``.bandit.yml`` ranked first, and the source-first key cannot help there --
+    ``.yml`` is a source extension. That scenario is a retrieval failure (no source file
+    is returned at all), not a ranking one, and ROADMAP 12.26 records it as such.
+
+    The key does separate a genuinely non-source file, which is where the measured
+    ``tests/test_text.py`` regression sat.
+    """
+    from sylphae.agent.explorer import _candidate_sort_key
+
+    # .rst is not in POLYGLOT_EXTENSIONS.
+    doc = _cand("docs/source/api.rst", 1.00)
+    source = _cand("src/flake8/defaults.py", 0.10)
+    assert _candidate_sort_key(source) < _candidate_sort_key(doc)
+
+
+def test_score_still_decides_between_files_of_the_same_kind():
+    """The new keys must not flatten the ranking into source-vs-not-source only."""
+    from sylphae.agent.explorer import _candidate_sort_key
+
+    better = _cand("pkg/a.py", 0.90)
+    worse = _cand("pkg/b.py", 0.10)
+    assert _candidate_sort_key(better) < _candidate_sort_key(worse)
+
+
+def test_the_key_is_deterministic_for_equal_scores():
+    """Ties must not depend on dict insertion order, or two runs are not comparable."""
+    from sylphae.agent.explorer import _candidate_sort_key
+
+    assert _candidate_sort_key(_cand("pkg/b.py", 0.5)) == _candidate_sort_key(
+        _cand("pkg/a.py", 0.5)
+    ) or _candidate_sort_key(_cand("pkg/b.py", 0.5)) != _candidate_sort_key(
+        _cand("pkg/a.py", 0.5)
+    )
+    assert sorted([_cand("pkg/b.py", 0.5), _cand("pkg/a.py", 0.5)],
+                  key=_candidate_sort_key) == [_cand("pkg/a.py", 0.5),
+                                               _cand("pkg/b.py", 0.5)]
